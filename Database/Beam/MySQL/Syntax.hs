@@ -617,4 +617,3 @@ mysqlNumPrec (Just (d, Just n)) = mysqlParens (emit (fromString (show d)) <> emi
 mysqlOptCharSet :: Maybe T.Text -> MysqlSyntax
 mysqlOptCharSet Nothing = mempty
 mysqlOptCharSet (Just cs) = emit " CHARACTER SET " <> mysqlIdentifier cs
-

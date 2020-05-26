@@ -1,6 +1,5 @@
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE CPP #-}
-
 module Database.Beam.MySQL.Connection
     ( MySQL(..), MySQL.Connection
     , MySQLM(..)
@@ -11,6 +10,8 @@ module Database.Beam.MySQL.Connection
     , MysqlSelectSyntax(..), MysqlInsertSyntax(..)
     , MysqlUpdateSyntax(..), MysqlDeleteSyntax(..)
     , MysqlExpressionSyntax(..)
+
+    , runInsertRowReturning
 
     , MySQL.connect, MySQL.close
 
@@ -427,3 +428,69 @@ runInsertReturningList (SqlInsert _ is@(MysqlInsertSyntax tn@(MysqlTableNameSynt
 
 instance Beam.MonadBeamInsertReturning MySQL MySQLM where
   runInsertReturningList = runInsertReturningList
+
+runInsertRowReturning
+  :: FromBackendRow MySQL (table Identity)
+  => SqlInsert MySQL table
+  -> MySQLM (Maybe (table Identity))
+runInsertRowReturning SqlInsertNoRows = pure Nothing
+runInsertRowReturning (SqlInsert _ is@(MysqlInsertSyntax tn@(MysqlTableNameSyntax schema table) fields values)) =
+  case values of
+    MysqlInsertSelectSyntax _    -> fail "Not implemented runInsertReturningList part handling: INSERT INTO .. SELECT .."
+    MysqlInsertValuesSyntax (_:_:_) -> fail "runInsertRowReturning can't be used to insert several rows"
+    MysqlInsertValuesSyntax ([]) -> pure Nothing
+    MysqlInsertValuesSyntax ([vals]) -> do
+      let tableB  = emit $ TE.encodeUtf8Builder $ table
+      let schemaB = emit $ TE.encodeUtf8Builder $ maybe "DATABASE()" (\s -> "'" <> s <> "'") schema
+
+      (keycols :: [T.Text]) <- runReturningList $ MysqlCommandSyntax $
+        emit "SELECT `column_name` FROM `information_schema`.`columns` WHERE " <>
+        emit "`table_schema`=" <> schemaB <> emit " AND `table_name`='" <> tableB <>
+        emit "' AND `column_key` LIKE 'PRI'"
+
+      let primaryKeyCols = intersect keycols fields
+
+      when (null primaryKeyCols) $ fail "Table PK is not part of beam-table. Tables with no PK not allowed."
+
+      (mautoIncrementCol :: Maybe T.Text) <- runReturningOne $ MysqlCommandSyntax $
+        emit "SELECT `column_name` FROM `information_schema`.`columns` WHERE " <>
+        emit "`table_schema`=" <> schemaB <> emit " AND `table_name`='" <> tableB <>
+        emit "' AND `extra` LIKE 'auto_increment'"
+
+      let equalTo :: (T.Text, MysqlExpressionSyntax) -> MysqlSyntax
+          equalTo (field, value) = mysqlIdentifier field <> emit "=" <> fromMysqlExpression value
+
+      let fieldsExpr = mysqlSepBy (emit ", ") $ fmap mysqlIdentifier fields
+
+      let selectByPrimaryKeyCols colValues =
+            -- Select inserted rows by Primary Keys
+            -- Result can be totally wrong if some of (vals :: MysqlExpressionSyntax) can result in
+            -- different values when evaluated by db.
+            runReturningOne $ MysqlCommandSyntax $
+              emit "SELECT " <> fieldsExpr <> emit " FROM " <> fromMysqlTableName tn <> emit " WHERE " <>
+              (mysqlSepBy (emit " AND ") . fmap equalTo . filter ((`elem` primaryKeyCols) . fst) $ colValues)
+
+      let insertReturningWithoutAutoincrement = do
+            runNoReturn $ MysqlCommandSyntax $ fromMysqlInsert is
+            selectByPrimaryKeyCols $ zip fields vals
+
+      case mautoIncrementCol of
+        Nothing -> insertReturningWithoutAutoincrement -- no AI we can use PK to select inserted rows.
+        Just aiCol ->
+          if notElem aiCol primaryKeyCols
+          then insertReturningWithoutAutoincrement    -- AI exists and not part of PK, so we don't care about it
+          else do                                     -- AI exists and is part of PK
+            runNoReturn $ MysqlCommandSyntax $
+              fromMysqlInsert $ MysqlInsertSyntax tn fields (MysqlInsertValuesSyntax [vals])
+
+            -- hacky. But is there any other way to figure out if AI field is set to some value, or DEFAULT, for example?
+            let compareMysqlExpressions a b =
+                  (toLazyByteString $ unwrapInnerBuilder $ fromMysqlExpression a) ==
+                  (toLazyByteString $ unwrapInnerBuilder $ fromMysqlExpression b)
+
+            let compareWithAutoincrement (field, value) =
+                  (field, if field == aiCol && compareMysqlExpressions value defaultE
+                          then MysqlExpressionSyntax $ emit "last_insert_id()"
+                          else value)
+
+            selectByPrimaryKeyCols . map compareWithAutoincrement $ zip fields vals
